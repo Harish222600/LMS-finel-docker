@@ -3,6 +3,9 @@ const BundleAccessRequest = require('../models/bundleAccessRequest');
 const Course = require('../models/course');
 const User = require('../models/user');
 const Order = require('../models/order');
+const RatingAndReview = require('../models/ratingAndReview');
+const { convertSecondsToDuration } = require("../utils/secToDuration");
+const mongoose = require('mongoose');
 
 // ================ REQUEST COURSE ACCESS ================
 exports.requestCourseAccess = async (req, res) => {
@@ -236,6 +239,46 @@ exports.handleAccessRequest = async (req, res) => {
     }
 };
 
+// Helper function to calculate average rating
+const calculateAverageRating = async (courseId) => {
+    try {
+        const result = await RatingAndReview.aggregate([
+            {
+                $match: {
+                    course: new mongoose.Types.ObjectId(courseId),
+                },
+            },
+            {
+                $group: {
+                    _id: null,
+                    averageRating: { 
+                        $avg: "$rating"
+                    },
+                    totalRatings: { $sum: 1 }
+                }
+            }
+        ]);
+
+        if (result.length > 0) {
+            return {
+                averageRating: result[0].averageRating,
+                totalRatings: result[0].totalRatings
+            };
+        }
+        
+        return {
+            averageRating: 0,
+            totalRatings: 0
+        };
+    } catch (error) {
+        console.log('Error calculating average rating:', error);
+        return {
+            averageRating: 0,
+            totalRatings: 0
+        };
+    }
+};
+
 // ================ GET FREE COURSES ================
 exports.getFreeCourses = async (req, res) => {
     try {
@@ -255,16 +298,54 @@ exports.getFreeCourses = async (req, res) => {
         const courses = await Course.find(filter)
             .populate('instructor', 'firstName lastName')
             .populate('category', 'name')
-            .select('courseName courseDescription thumbnail price originalPrice courseType tag createdAt')
+            .populate({
+                path: "courseContent",
+                populate: {
+                    path: "subSection",
+                    select: "timeDuration"
+                }
+            })
+            .select('courseName courseDescription thumbnail price originalPrice courseType tag createdAt studentsEnrolled courseContent')
             .sort({ createdAt: -1 })
             .skip(skip)
             .limit(parseInt(limit));
+
+        // Add average rating and total duration to each course
+        const coursesWithRatingAndDuration = await Promise.all(
+            courses.map(async (course) => {
+                const ratingData = await calculateAverageRating(course._id);
+                
+                // Calculate total duration
+                let totalDurationInSeconds = 0;
+                if (course.courseContent) {
+                    course.courseContent.forEach((content) => {
+                        if (content.subSection) {
+                            content.subSection.forEach((subSection) => {
+                                const timeDurationInSeconds = parseFloat(subSection.timeDuration);
+                                if (!isNaN(timeDurationInSeconds) && timeDurationInSeconds > 0) {
+                                    totalDurationInSeconds += timeDurationInSeconds;
+                                }
+                            });
+                        }
+                    });
+                }
+                
+                const totalDuration = convertSecondsToDuration(totalDurationInSeconds);
+                
+                return {
+                    ...course.toObject(),
+                    averageRating: ratingData.averageRating,
+                    totalRatings: ratingData.totalRatings,
+                    totalDuration: totalDuration
+                };
+            })
+        );
 
         const totalCourses = await Course.countDocuments(filter);
 
         return res.status(200).json({
             success: true,
-            data: courses,
+            data: coursesWithRatingAndDuration,
             pagination: {
                 currentPage: parseInt(page),
                 totalPages: Math.ceil(totalCourses / limit),
